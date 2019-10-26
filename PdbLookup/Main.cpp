@@ -6,11 +6,12 @@
 #include <fstream>
 #include <string>
 #include <string_view>
-#include <sstream>
 #include <vector>
 #include <algorithm>
 #include <optional>
 #include <limits>
+#include <variant>
+#include <unordered_map>
 
 #define _WIN32_WINNT _WIN32_WINNT_WIN7                   
 // // SDKDDKVer.h をインクルードすると、利用できる最も高いレベルの Windows プラットフォームが定義されます。
@@ -25,17 +26,14 @@
 #pragma comment(lib,"diaguids.lib")
 //#import "dia2/dia2.tlb" auto_rename, no_namespace
 
-#include <Objbase.h>
 #include <comip.h>
 #include <comdef.h>
 #include <comdefsp.h>
-#include <dbghelp.h> 
-#include <wincrypt.h> 
+#include <dbghelp.h> // UNDNAME_COMPLETE
 
-#include <shlwapi.h> // QISearch
-#pragma comment(lib, "shlwapi.lib")
-
-#include "CBcrypt.h"
+#include "CBcrypt.hpp"
+#include "checked_cast.hpp"
+#include "to_hexwstring.hpp"
 
 typedef int _Bool;
 
@@ -54,6 +52,7 @@ using namespace std::string_literals;
 using namespace std::literals::string_view_literals;
 using std::begin;
 using std::end;
+
 
 constexpr std::size_t operator "" _z(unsigned long long n)
 {
@@ -75,114 +74,17 @@ _COM_SMARTPTR_TYPEDEF(IDiaEnumLineNumbers, __uuidof(IDiaEnumLineNumbers));
 _COM_SMARTPTR_TYPEDEF(IDiaSourceFile, __uuidof(IDiaSourceFile));
 _COM_SMARTPTR_TYPEDEF(IDiaEnumSourceFiles, __uuidof(IDiaEnumSourceFiles));
 
-class CErrorInfo : public IErrorInfo
-{
-	GUID m_GUID;
-	_bstr_t m_Description;
-	ULONG volatile m_RefCnt = 0;
-	CErrorInfo(LPCWSTR desc)
-		: m_Description(desc)
-	{
-		::CoCreateGuid(&m_GUID);
-	}
-public:
-	static CErrorInfo* Create(LPCWSTR desc)
-	{
-		return new(std::nothrow) CErrorInfo{ desc };
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE QueryInterface(
-		/* [in] */ REFIID riid,
-		/* [iid_is][out] */ _COM_Outptr_ void __RPC_FAR *__RPC_FAR *ppvObject)
-	{
-		if (riid == __uuidof(IErrorInfo))
-		{
-			*ppvObject = (IErrorInfo*)this;
-			return S_OK;
-		}
-		return E_NOINTERFACE;
-	}
-
-	virtual ULONG STDMETHODCALLTYPE AddRef(void)
-	{
-		return ::InterlockedIncrement(&m_RefCnt);
-	}
-
-	virtual ULONG STDMETHODCALLTYPE Release(void)
-	{
-		auto cnt = ::InterlockedDecrement(&m_RefCnt);
-		if (cnt == 0)
-		{
-			delete this;
-		}
-		return cnt;
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE GetGUID(
-		/* [out] */ __RPC__out GUID *pGUID)
-	{
-		*pGUID = m_GUID;
-		return S_OK;
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE GetSource(
-		/* [out] */ __RPC__deref_out_opt BSTR *)
-	{
-		return E_NOTIMPL;
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE GetDescription(
-		/* [out] */ __RPC__deref_out_opt BSTR *pBstrDescription)
-	{
-		*pBstrDescription = m_Description;
-		return S_OK;
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE GetHelpFile(
-		/* [out] */ __RPC__deref_out_opt BSTR *)
-	{
-		return E_NOTIMPL;
-	}
-
-	virtual HRESULT STDMETHODCALLTYPE GetHelpContext(
-		/* [out] */ __RPC__out DWORD *)
-	{
-		return E_NOTIMPL;
-	}
-};
 
 inline void throw_if_failed(HRESULT hr, LPCTSTR message = nullptr)
 {
 	if (FAILED(hr))
 	{
-		throw _com_error(hr, CErrorInfo::Create(message));
+		throw _com_error(hr);
 	}
 }
 
-template <size_t width = 1>
-inline std::wstring to_hexwstring(ULONGLONG val)
-{
-	wchar_t buf[std::max(sizeof(val) * 2, width) + 1];
-	std::swprintf(buf, std::size(buf), L"%0*llx", width, val);
-	return buf;
-}
-
-template <size_t width = 1>
-inline std::wstring to_hexwstring(DWORD val)
-{
-	wchar_t buf[std::max(sizeof(val) * 2, width) + 1];
-	std::swprintf(buf, std::size(buf), L"%0*lx", width, val);
-	return buf;
-}
-
-template <size_t width = 1>
-inline std::wstring to_hexwstring(long val)
-{
-	return to_hexwstring<width>(static_cast<DWORD>(val));
-}
-
 template <int width = 1>
-inline std::wstring to_wstring(DWORD val)
+inline std::wstring to_wstring(unsigned long val)
 {
 	wchar_t buf[std::max(std::numeric_limits<decltype(val)>::digits10 + 1, width) + 1];
 	std::swprintf(buf, std::size(buf), L"%*lu", width, val);
@@ -199,6 +101,10 @@ template <class CharT, class AlgTraits = std::char_traits<CharT> >
 inline constexpr bool starts_with(const CharT *s, std::basic_string_view<CharT, AlgTraits>  x) noexcept
 {
 	return starts_with(std::basic_string_view<CharT>(s), x);
+}
+
+std::ostream& operator <<(std::ostream& ros, const _bstr_t &str) {
+	return ros << (const wchar_t*)str;
 }
 
 class CCoInitialize final
@@ -236,7 +142,7 @@ win32_handle make_win32_handle(HANDLE h) noexcept
 	return { (h == INVALID_HANDLE_VALUE ? nullptr : h), ::CloseHandle };
 }
 
-constexpr LPCWSTR tagNames[SymTagMax] = {
+static constexpr LPCWSTR tagNames[SymTagMax] = {
 	L"Null",
 	L"Exe",
 	L"Compiland",
@@ -287,10 +193,6 @@ constexpr LPCWSTR tagNames[SymTagMax] = {
 	_bstr_t _name; \
 	throw_if_failed(_pSymbol->get_ ## _name(_name.GetAddress()));
 
-std::ostream& operator <<(std::ostream& ros, _bstr_t str) {
-	return ros << str.GetBSTR();
-}
-
 struct SymbolInfo
 {
 	std::wstring name;
@@ -301,8 +203,7 @@ struct SymbolInfo
 	enum SymTagEnum symTag;
 	bool code;
 	bool function;
-	std::wstring address;
-	std::optional<DWORD> addressSection,addressOffset;
+	std::optional<std::tuple<DWORD, DWORD>> address;
 	std::optional<ULONGLONG> virtualAddress;
 
 	inline std::optional<ULONGLONG> endOfRVA() const
@@ -318,6 +219,11 @@ struct SymbolInfo
 			return virtualAddress.value() + length - 1;
 		else
 			return {};
+	}
+	inline std::wstring addressStr() const
+	{
+		return (address) ?
+			(to_hexwstring<4>(std::get<0>(*address)) + L":" + to_hexwstring<8>(std::get<1>(*address))) : L"#N/A";
 	}
 };
 
@@ -342,20 +248,31 @@ std::vector<uint8_t> get_hash_from_file(LPCWSTR path, bool sha1) {
 	{
 		return {};
 	}
-	DWORD dwRead = 0;
-	BOOL success;
-	while ((success = ::ReadFile(hFile.get(), buf.get(), bufSize, &dwRead, nullptr)) && dwRead > 0) {
-		hash.Update(buf.get(), dwRead);
+
+	for (;;)
+	{
+		DWORD dwRead = 0;
+		BOOL success = ::ReadFile(hFile.get(), buf.get(), bufSize, &dwRead, nullptr);
+		if (!success)
+		{
+			return {};
+		}
+		else if (dwRead > 0)
+		{
+			hash.Update(buf.get(), dwRead);
+		}
+		else
+		{
+			break;
+		}
 	}
-	if (!success)
-		return {};
 	hash.Finish();
 	return hash.GetHashData();
 }
 
-std::vector<std::string> get_all_lines_file(LPCWSTR path) {
+std::vector<std::string> get_all_lines_from_file(LPCWSTR path) {
 	std::vector<std::string> allLines;
-	std::basic_ifstream<char> ifs{ path, std::ios::in };
+	std::ifstream ifs{ path, std::ios::in };
 	while (ifs.good()) {
 		std::string line;
 		if (std::getline(ifs, line)) {
@@ -383,7 +300,7 @@ void PrintSymbolAsCsv(const std::vector<SymbolInfo> &list)
 	for (auto &&entry : list)
 	{
 		std::wcout
-			<< L'"' << entry.address << L'"' << L","
+			<< L'"' << entry.addressStr() << L'"' << L","
 			<< L'"' << (entry.relativeVirtualAddress ? (L"0x" + to_hexwstring<8>(entry.relativeVirtualAddress.value())) : L"") << L'"' << L","
 			<< L'"' << (entry.endOfRVA() ? (L"0x" + to_hexwstring<8>(entry.endOfRVA().value())) : L"") << L'"' << L","
 			<< std::to_wstring(entry.length) << L","
@@ -434,7 +351,7 @@ int LookupSymbol(IDiaSession* pSession, Context &context)
 		IDiaSymbolPtr pSymbol;
 		long displacement = 0;
 		if (relative)
-			throw_if_failed(pSession->findSymbolByRVAEx(static_cast<DWORD>(va), SymTagNull, &pSymbol, &displacement));
+			throw_if_failed(pSession->findSymbolByRVAEx(checked_cast<DWORD>(va), SymTagNull, &pSymbol, &displacement));
 		else
 			throw_if_failed(pSession->findSymbolByVAEx(va, SymTagNull, &pSymbol, &displacement));
 
@@ -446,7 +363,7 @@ int LookupSymbol(IDiaSession* pSession, Context &context)
 	{
 		IDiaEnumLineNumbersPtr pLineNumsPtr;
 		if (relative)
-			throw_if_failed(pSession->findLinesByRVA(static_cast<DWORD>(va), 1, &pLineNumsPtr));
+			throw_if_failed(pSession->findLinesByRVA(checked_cast<DWORD>(va), 1, &pLineNumsPtr));
 		else
 			throw_if_failed(pSession->findLinesByVA(va, 1, &pLineNumsPtr));
 
@@ -463,11 +380,13 @@ int LookupSymbol(IDiaSession* pSession, Context &context)
 			GET_DIA_SYMBOL_PROPERTY_OPT(DWORD, checksumType, sourceFile);
 			std::vector<BYTE> buf;
 			buf.resize(
-				(checksumType.value() == ChecksumTypeMd5 ? 16_z : checksumType.value() == ChecksumTypeSha1 ? 20_z :1_z),
+				checksumType.value() == ChecksumTypeMd5 ? 16_z :
+				checksumType.value() == ChecksumTypeSha1 ? 20_z :
+				1_z,
 				0xFF_u8
 			);
 			DWORD cbData;
-			throw_if_failed(sourceFile->get_checksum(buf.capacity(), &cbData, buf.data()));
+			throw_if_failed(sourceFile->get_checksum(checked_cast<DWORD>(buf.capacity()), &cbData, buf.data()));
 
 			GET_DIA_SYMBOL_PROPERTY_BSTR(fileName, sourceFile);
 			GET_DIA_SYMBOL_PROPERTY_OPT(DWORD, lineNumber, pLineNumPtr);
@@ -475,17 +394,18 @@ int LookupSymbol(IDiaSession* pSession, Context &context)
 			GET_DIA_SYMBOL_PROPERTY_OPT(DWORD, columnNumber, pLineNumPtr);
 			GET_DIA_SYMBOL_PROPERTY_OPT(DWORD, columnNumberEnd, pLineNumPtr);
 
-			auto currentHashValue = get_hash_from_file(fileName.GetBSTR(), checksumType.value() == ChecksumTypeSha1);
+			auto currentHashValue = get_hash_from_file((LPCWSTR)fileName, checksumType.value() == ChecksumTypeSha1);
 			_bstr_t line;
 			if (!std::equal(buf.begin(), buf.end(), currentHashValue.cbegin()))
 			{
 				line = L"<hash value miss match>";
 			}
 
-			auto allLines = get_all_lines_file(fileName.GetBSTR());
+			auto allLines = get_all_lines_from_file((LPCWSTR)fileName);
 			if (lineNumber && lineNumber.value() < allLines.size() + 1)
 			{
-				line += allLines.at(lineNumber.value() - 1).c_str();
+				line +=
+					allLines.at(lineNumber.value() - 1).c_str();
 			}
 			else
 			{
@@ -499,38 +419,32 @@ int LookupSymbol(IDiaSession* pSession, Context &context)
 	return EXIT_SUCCESS;
 }
 
-// ??_C@_1CK@EOPGIILJ@?$AAi?$AAn?$AAv?$AAa?$AAl?$AAi?$AAd?$AA?5?$AAn?$AAu?$AAl?$AAl?$AA?5?$AAp?$AAo?$AAi?$AAn?$AAt?$AAe?$AAr?$AA?$AA@
-// ??_C@_02PCIJFNDE@?$AN?6?$AA@
-// ??_C@_15GANGMFKL@?$AA?$CF?$AAs?$AA?$AA@
-// ??_C@_0P@GHFPNOJB@bad?5allocation?$AA@
-// ??_C@_1EI@OLHENKJG@?$AAS?$AAY?$AAS?$AA_?$AAT?$AAh?$AAr?$AA?5?$AA?3?$AA?5?$AAS?$AAt?$AAa?$AAr?$AAt?$AAT?$AAh?$AAr?$AAe?$AAa?$AAd?$AA?5?$AAE?$AAr?$AAr?$AAo?$AAr?$AA?5?$AA?$DM?$AA?$CF?$AAd?$AA?$DO@
-std::tuple<std::string, std::wstring> DemangleStringConstants(LPCSTR symbolName)
+std::variant< std::string, std::wstring> DemangleStringConstants(LPCSTR symbolName)
 {
-	_Bool isDoubleByte = false;
-	auto length = UnDecorateStringSymbolName(symbolName, nullptr, 0, &isDoubleByte);
+	_Bool isUtf16Be = false;
+	auto length = UnDecorateStringSymbolName(symbolName, nullptr, 0, &isUtf16Be);
 	if (length)
 	{
 		std::vector<uint8_t> buf(length);
-		if (UnDecorateStringSymbolName(symbolName, buf.data(), length, &isDoubleByte))
+		if (UnDecorateStringSymbolName(symbolName, buf.data(), length, &isUtf16Be))
 		{
-			if (isDoubleByte)
+			if (isUtf16Be)
 			{
 				std::wstring str;
-				// UTF16-BE
 				for (decltype(length) i = 0; i < length; i += 2)
 				{
 					str.push_back(wchar_t(buf.at(i) << 8 | buf.at(i + 1)));
 				}
-				return std::make_tuple(std::string{}, str);
+				return str;
 			}
 			else
 			{
-				return std::make_tuple(std::string{ reinterpret_cast<char*>(buf.data()), length / sizeof(wchar_t) }, std::wstring{});
+				return std::string{ reinterpret_cast<char*>(buf.data()), length / sizeof(wchar_t) };
 			}
 		}
 	}
 
-	return std::make_tuple(symbolName, std::wstring{});
+	return symbolName;
 }
 
 int PrintAllymbols(IDiaSession* pSession, Context &context)
@@ -696,32 +610,6 @@ int PrintAllymbols(IDiaSession* pSession, Context &context)
 			GET_DIA_SYMBOL_PROPERTY_OPT(BOOL, isCxxReturnUdt, pSymbol);
 			GET_DIA_SYMBOL_PROPERTY_OPT(BOOL, isConstructorVirtualBase, pSymbol);
 
-			if (
-				relativeVirtualAddress && relativeVirtualAddress.value() > 0 && symTag.value() == SymTagData)
-			{
-				auto len = length == 0;
-			}
-			if (
-				/*false && */ symTag.value() == SymTagFunction)
-			{
-				std::wstring fileNames;
-				IDiaEnumSourceFilesPtr pEnumSourceFiles;
-				HRESULT hr = pSession->findFile(pSymbol, nullptr, nsNone, &pEnumSourceFiles);
-
-				IDiaSourceFilePtr sourceFile;
-				ULONG celt;
-				ULONG cnt = 0;
-				while (SUCCEEDED(hr) && SUCCEEDED(pEnumSourceFiles->Next(1, &sourceFile, &celt)) && celt == 1)
-				{
-					if (cnt != 0)
-						fileNames += L";";
-
-					GET_DIA_SYMBOL_PROPERTY_BSTR(fileName, sourceFile);
-					fileNames += fileName;
-					cnt++;
-				}
-			}
-
 			std::optional<BOOL> isVirtual;
 			{
 				BOOL tmp;
@@ -734,17 +622,15 @@ int PrintAllymbols(IDiaSession* pSession, Context &context)
 			throw_if_failed(pSymbol->get_undecoratedNameEx(UNDNAME_COMPLETE, undecoratedNameEx.GetAddress()));
 
 			list.emplace_back(SymbolInfo{
-				name.GetBSTR(),
+				(LPCWSTR)name,
 				relativeVirtualAddress,
 				length.value_or(0),
-				(undecoratedNameEx.length() > 0 ? undecoratedNameEx.GetBSTR() : L""),
-				(sourceFileName.length() > 0 ? sourceFileName.GetBSTR() : L""),
+				(undecoratedNameEx.length() > 0 ? (LPCWSTR)undecoratedNameEx : L""),
+				(sourceFileName.length() > 0 ? (LPCWSTR)sourceFileName : L""),
 				static_cast<enum SymTagEnum>(symTag.value()),
 				code != FALSE,
 				function != FALSE,
-				(addressSection && addressOffset) ?
-					(to_hexwstring<4>(addressSection.value()) + L":" + to_hexwstring<8>(addressOffset.value())) : L"#N/A",
-				addressSection, addressOffset,
+				(addressSection && addressOffset) ? std::make_optional(std::make_tuple(*addressSection, *addressOffset)) : decltype(SymbolInfo::address){},
 				virtualAddress,
 				});
 		}
@@ -752,19 +638,24 @@ int PrintAllymbols(IDiaSession* pSession, Context &context)
 
 	std::stable_sort(list.begin(), list.end(),
 		[](auto const &left, auto const &right)->bool {
-			return std::less<DWORD>{}(left.relativeVirtualAddress.value_or(0), right.relativeVirtualAddress.value_or(0)); });
+		return
+			std::less{}(left.address, right.address) &&
+			std::less{}(left.relativeVirtualAddress, right.relativeVirtualAddress);
+	});
 
 	// fix length
 	for (size_t i = 1; i < list.size(); ++i)
 	{
 		auto &&before = list[i - 1];
 		auto &&info = list[i];
-		if (
-			before.addressSection == info.addressSection &&
-			before.addressOffset < info.addressOffset
-			)
+		if (before.address && info.address)
 		{
-			before.length = info.addressOffset.value() - before.addressOffset.value();
+			auto &&[beforeSection, beforeOffset] = *before.address;
+			auto &&[addressSection, addressOffset] = *info.address;
+			if (beforeSection == addressSection && beforeOffset < addressOffset)
+			{
+				before.length = addressOffset - beforeOffset;
+			}
 		}
 	}
 
@@ -776,7 +667,7 @@ int PrintAllymbols(IDiaSession* pSession, Context &context)
 constexpr auto commandName = L"PdbLookup"sv;
 
 int ShowHelp(IDiaSession*, Context &);
-typedef int(*fpCommand_t)(IDiaSession* pSession, Context &context);
+using fpCommand_t = int (*)(IDiaSession* pSession, Context &context);
 
 constexpr struct {
 	LPCWSTR name;
@@ -791,7 +682,7 @@ constexpr struct {
 int ShowHelp()
 {
 	std::wcerr << commandName << L" subcommand <module-path> [options]" << std::endl;
-	std::wcerr << L"subcommand:" << std::endl;
+	std::wcerr << L"sub command:" << std::endl;
 	for (auto &&i : subCommandTable)
 	{
 		std::wcerr << L"  " << i.name << L"\t" << i.description << std::endl;
@@ -799,6 +690,7 @@ int ShowHelp()
 	std::wcerr << L"options:" << std::endl;
 	std::wcerr << L"  --pdbpath <path to dir>" << std::endl;
 	std::wcerr << L"  --loadaddr=addr" << std::endl;
+	std::wcerr << L"  --out <path>" << std::endl;
 	return EXIT_FAILURE;
 }
 
@@ -837,8 +729,7 @@ int Setup(int argc, TCHAR *argv[], fpCommand_t &fpCommand, Context &c)
 		{
 			if (i + 1 < argc)
 			{
-				c.pdbpath = argv[i];
-				++i;
+				c.pdbpath = argv[++i];
 			}
 			else
 			{
@@ -850,12 +741,54 @@ int Setup(int argc, TCHAR *argv[], fpCommand_t &fpCommand, Context &c)
 		{
 			c.loadAddress = std::stoull(argv[i] + (L"--loadaddr="sv).length(), nullptr, 16);
 		}
+		else if (starts_with(argv[i], L"--out"sv))
+		{
+			if (i + 1 < argc)
+			{
+				FILE *fp = nullptr;
+				if (_wfreopen_s(&fp, argv[++i], L"w", stdout) != 0)
+				{
+					std::wcerr << L"can't set output to `" << argv[i] << L"`" << L"\n";
+					return EXIT_FAILURE;
+				}
+			}
+			else
+			{
+				std::wcerr << L"missing args.:`--out <path>`" << L"\n";
+				return EXIT_FAILURE;
+			}
+		}
 		else
 		{
 			c.args.push_back(argv[i]);
 		}
 	}
 	return EXIT_SUCCESS;
+}
+
+
+std::optional<ULONGLONG> GetImageBaseFromPE(LPCWSTR path)
+{
+	auto hFile = make_win32_handle(::CreateFile(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+
+	static constexpr BYTE magic[] = { 'P','E','\0','\0' };
+	DWORD read{};
+	IMAGE_DOS_HEADER dosHeader{};
+	IMAGE_NT_HEADERS header{};
+	if (hFile && ::ReadFile(hFile.get(), &dosHeader, sizeof(dosHeader), &read, nullptr) && read == sizeof(dosHeader))
+	{
+		if (SetFilePointer(hFile.get(), dosHeader.e_lfanew, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER)
+		{
+			if (::ReadFile(hFile.get(), &header, sizeof(header), &read, nullptr) && read == sizeof(header) &&
+				(memcmp(&header.Signature, magic, sizeof(magic)) == 0) &&
+				header.FileHeader.SizeOfOptionalHeader >= sizeof(header.OptionalHeader))
+			{
+				return header.OptionalHeader.ImageBase;
+			}
+		}
+	}
+	std::wcerr << "warning: Can't get ImageBase.";
+	return {};
 }
 
 int wmain(int argc, TCHAR *argv[])
@@ -896,6 +829,10 @@ try
 		{
 			throw_if_failed(pDataSource->loadDataForExe(c.filePath, (c.pdbpath.length() > 0 ? c.pdbpath.c_str() : nullptr),
 				nullptr), L"PDBファイルの読み込みに失敗しました。");
+
+			auto imageBase = GetImageBaseFromPE(c.filePath);
+			if (imageBase)
+				c.loadAddress = imageBase.value();
 		}
 
 		IDiaSessionPtr pSession;
@@ -912,7 +849,37 @@ try
 }
 catch (const _com_error& e)
 {
-	std::wcerr << e.ErrorMessage();
+	const static std::unordered_map<HRESULT, LPCTSTR> dia_errors = {
+		{E_PDB_OK, L"E_PDB_OK"},
+		{E_PDB_USAGE, L"E_PDB_USAGE"},
+		{E_PDB_OUT_OF_MEMORY, L"E_PDB_OUT_OF_MEMORY"},
+		{E_PDB_FILE_SYSTEM, L"E_PDB_FILE_SYSTEM"},
+		{E_PDB_NOT_FOUND, L"E_PDB_NOT_FOUND"},
+		{E_PDB_INVALID_SIG, L"E_PDB_INVALID_SIG"},
+		{E_PDB_INVALID_AGE, L"E_PDB_INVALID_AGE"},
+		{E_PDB_PRECOMP_REQUIRED, L"E_PDB_PRECOMP_REQUIRED"},
+		{E_PDB_OUT_OF_TI, L"E_PDB_OUT_OF_TI"},
+		{E_PDB_NOT_IMPLEMENTED, L"E_PDB_NOT_IMPLEMENTED"},
+		{E_PDB_V1_PDB, L"E_PDB_V1_PDB"},
+		{E_PDB_FORMAT, L"E_PDB_FORMAT"},
+		{E_PDB_LIMIT, L"E_PDB_LIMIT"},
+		{E_PDB_CORRUPT, L"E_PDB_CORRUPT"},
+		{E_PDB_TI16, L"E_PDB_TI16"},
+		{E_PDB_ACCESS_DENIED, L"E_PDB_ACCESS_DENIED"},
+		{E_PDB_ILLEGAL_TYPE_EDIT, L"E_PDB_ILLEGAL_TYPE_EDIT"},
+		{E_PDB_INVALID_EXECUTABLE, L"E_PDB_INVALID_EXECUTABLE"},
+		{E_PDB_DBG_NOT_FOUND, L"E_PDB_DBG_NOT_FOUND"},
+		{E_PDB_NO_DEBUG_INFO, L"E_PDB_NO_DEBUG_INFO"},
+		{E_PDB_INVALID_EXE_TIMESTAMP, L"E_PDB_INVALID_EXE_TIMESTAMP"},
+		{E_PDB_RESERVED, L"E_PDB_RESERVED"},
+		{E_PDB_DEBUG_INFO_NOT_IN_PDB, L"E_PDB_DEBUG_INFO_NOT_IN_PDB"},
+		{E_PDB_SYMSRV_BAD_CACHE_PATH, L"E_PDB_SYMSRV_BAD_CACHE_PATH"},
+		{E_PDB_SYMSRV_CACHE_FULL, L"E_PDB_SYMSRV_CACHE_FULL"},
+	};
+
+	auto && i = dia_errors.find(e.Error());
+
+	std::wcerr << (i != dia_errors.end()) ? i->second : e.ErrorMessage();
 	return EXIT_FAILURE;
 }
 catch (const std::exception& e)

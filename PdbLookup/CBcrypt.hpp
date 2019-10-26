@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment (lib, "bcrypt.lib")
+
 class CBcryptHash;
 struct CBcryptPsudoHandles;
 
@@ -28,7 +29,7 @@ struct CBCryptException final
 
 #define CBCRYPT_RETURN_NTSTATUS CBCRYPT_RETURN
 #else
-#define CBCRYPT_RESULT void
+using CBCRYPT_RESULT = void;
 
 #define CBCRYPT_CHECK(_exp) _exp
 
@@ -187,7 +188,7 @@ public:
 	CBCRYPT_RESULT Finish()
 	{
 		// cbOutput must same the hash size
-		CBCRYPT_RETURN_NTSTATUS(::BCryptFinishHash(m_handle, m_HashData.data(), m_HashData.size(), 0));
+		CBCRYPT_RETURN_NTSTATUS(::BCryptFinishHash(m_handle, m_HashData.data(), static_cast<ULONG>(m_HashData.size()), 0));
 	}
 	auto& GetHashData() const
 	{

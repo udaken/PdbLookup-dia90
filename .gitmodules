@@ -1,0 +1,3 @@
+[submodule "checked_cast"]
+	path = checked_cast
+	url = https://github.com/udaken/checked_cast.git
